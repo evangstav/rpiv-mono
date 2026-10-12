@@ -25,7 +25,7 @@ export const fullRowBudget: RowBudget = (terminalRows) => terminalRows;
  */
 export const HOST_ALLOCATED_ROWS = Symbol.for("rpiv-ask-user-question:host-allocated-rows");
 
-function hostAllocatesRows(terminal: object): boolean {
+export function hostAllocatesRows(terminal: object): boolean {
 	return (terminal as Record<symbol, unknown>)[HOST_ALLOCATED_ROWS] === true;
 }
 

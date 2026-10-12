@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { registerAskUserQuestionTool } from "./ask-user-question.js";
 import { HOST_ALLOCATED_ROWS, resolvePresentation } from "./presentation.js";
 import type { QuestionnaireSessionComponent } from "./state/questionnaire-session.js";
+import { makeTestTui } from "./test-fixtures.js";
 import type { QuestionnaireResult } from "./tool/types.js";
 import { HINT_PART_CANCEL } from "./view/dialog-builder.js";
 
@@ -244,11 +245,8 @@ describe("inline presentation", () => {
 			(factory, options) =>
 				new Promise((resolve) => {
 					calls.push(options);
-					const tui = {
-						requestRender() {},
-						terminal: { columns: 100, rows: 24 },
-						hasOverlay: () => overlayShowing,
-					};
+					const tui = makeTestTui();
+					vi.spyOn(tui, "hasOverlay").mockImplementation(() => overlayShowing);
 					const component = factory(tui, theme, getKeybindings(), resolve);
 					if (options?.overlay) {
 						expect(component.render(100).length).toBeGreaterThan(1);
