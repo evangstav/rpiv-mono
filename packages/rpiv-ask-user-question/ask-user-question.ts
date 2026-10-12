@@ -193,6 +193,7 @@ function registerCollapseKeyListener(
  * they must stay lazy per-invocation.
  */
 function makeSessionFactory(config: {
+	onEditorStart: (pending: Promise<string | undefined>) => void;
 	ctx: ExtensionContext;
 	typed: QuestionParams;
 	itemsByTab: WrappingSelectItem[][];
@@ -201,6 +202,7 @@ function makeSessionFactory(config: {
 	presentation: Presentation;
 	sessionRef: SessionRef;
 	Session: SessionModule["QuestionnaireSession"];
+	signal?: AbortSignal;
 }) {
 	const { ctx, typed, itemsByTab, collapseKey, canReopenWhileHidden, presentation, sessionRef, Session } = config;
 	return (
@@ -222,22 +224,30 @@ function makeSessionFactory(config: {
 			itemsByTab,
 			done,
 			keybindings,
-			editInput: async (value) => {
-				try {
-					const [{ SettingsManager }, { editWithExternalEditor }] = await Promise.all([
-						import("@earendil-works/pi-coding-agent"),
-						import("./state/external-editor.js"),
-					]);
-					const editorCommand = SettingsManager.create(ctx.cwd, undefined, {
-						projectTrusted: ctx.isProjectTrusted(),
-					}).getExternalEditorCommand();
-					if (!editorCommand) throw new Error("No external editor command is configured");
-					return await editWithExternalEditor(tui, editorCommand, value);
-				} catch (error) {
-					const message = error instanceof Error ? error.message : String(error);
-					ctx.ui.notify(`${t("editor.failed", "External editor failed")}: ${message}`, "error");
-					return undefined;
-				}
+			editInput: (value) => {
+				const pending = (async () => {
+					try {
+						const [{ SettingsManager }, { editWithExternalEditor }] = await Promise.all([
+							import("@earendil-works/pi-coding-agent"),
+							import("./state/external-editor.js"),
+						]);
+						const editorCommand = SettingsManager.create(ctx.cwd, undefined, {
+							projectTrusted: ctx.isProjectTrusted(),
+						}).getExternalEditorCommand();
+						if (!editorCommand) throw new Error("No external editor command is configured");
+						return await editWithExternalEditor(tui, editorCommand, value, config.signal);
+					} catch (error) {
+						if (config.signal?.aborted) {
+							done({ answers: [], cancelled: true });
+							return undefined;
+						}
+						const message = error instanceof Error ? error.message : String(error);
+						ctx.ui.notify(`${t("editor.failed", "External editor failed")}: ${message}`, "error");
+						return undefined;
+					}
+				})();
+				config.onEditorStart(pending);
+				return pending;
 			},
 			collapseKey,
 			canReopenWhileHidden,
@@ -269,6 +279,7 @@ async function mountQuestionnaire(config: {
 	collapseKey: string;
 	presentation: Presentation;
 	Session: SessionModule["QuestionnaireSession"];
+	signal?: AbortSignal;
 }): Promise<QuestionnaireResult | undefined> {
 	const { ctx, collapseKey, presentation } = config;
 	const sessionRef: SessionRef = { current: null };
@@ -280,9 +291,17 @@ async function mountQuestionnaire(config: {
 	// may emit `setHidden` only when it was actually registered; otherwise collapse falls
 	// back to the visible one-line row.
 	const canReopenWhileHidden = removeOverlayInputListener !== undefined;
+	let editorCompletion: Promise<string | undefined> | undefined;
 	try {
 		return await ctx.ui.custom<QuestionnaireResult>(
-			makeSessionFactory({ ...config, canReopenWhileHidden, sessionRef }),
+			makeSessionFactory({
+				onEditorStart: (pending) => {
+					editorCompletion = pending;
+				},
+				...config,
+				canReopenWhileHidden,
+				sessionRef,
+			}),
 			presentation.overlay
 				? {
 						overlay: true,
@@ -300,7 +319,12 @@ async function mountQuestionnaire(config: {
 				: { overlay: false },
 		);
 	} finally {
-		removeOverlayInputListener?.();
+		try {
+			removeOverlayInputListener?.();
+		} finally {
+			// Keep the mount and blocked lifecycle open until editor cleanup restores the TUI.
+			await editorCompletion?.catch(() => {});
+		}
 	}
 }
 
@@ -384,7 +408,8 @@ export function registerAskUserQuestionTool(pi: ExtensionAPI): void {
 		// Undo double-encoded nested arguments before Pi validates them (#244).
 		prepareArguments: prepareQuestionArguments,
 
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			signal?.throwIfAborted();
 			// Line-terminator normalization runs once here, ahead of validation, so
 			// every downstream consumer — validator, TUI, RPC walker, envelope, prompt
 			// event — sees the same clean text (#192).
@@ -431,7 +456,15 @@ export function registerAskUserQuestionTool(pi: ExtensionAPI): void {
 			// or stacked when another overlay is already on screen (see below).
 			let presentation = resolvePresentation();
 			const mount = (p: Presentation) =>
-				mountQuestionnaire({ ctx, typed, itemsByTab, collapseKey, presentation: p, Session: QuestionnaireSession });
+				mountQuestionnaire({
+					ctx,
+					typed,
+					itemsByTab,
+					collapseKey,
+					presentation: p,
+					Session: QuestionnaireSession,
+					signal,
+				});
 
 			emitAskUserBlockedEvent(pi, true);
 			try {
@@ -444,6 +477,7 @@ export function registerAskUserQuestionTool(pi: ExtensionAPI): void {
 					result = await mount(presentation);
 				}
 
+				signal?.throwIfAborted();
 				if (result === undefined) {
 					return resolveUndefinedResult(ctx, typed);
 				}
